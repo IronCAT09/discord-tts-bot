@@ -1,22 +1,34 @@
 """Discord-бот, который озвучивает сообщения определённых игроков через SaluteSpeech.
 
-Логика:
-  1. Игрок из списка (allowed_users.json) пишет в ЧАТ голосового канала
-     (встроенный текстовый чат voice-канала).
-  2. Если канал есть в списке отслеживаемых (TRACKED_CHANNEL_IDS) — бот заходит
-     в этот голосовой канал.
-  3. Текст сообщения превращается в речь (SaluteSpeech) и проигрывается.
-  4. Сообщения ставятся в очередь, чтобы не накладываться друг на друга.
+Режимы подключения (CONNECTION_MODE, переключается командой !mode):
+  - auto   — бот сам заходит в голосовой канал, когда игрок из списка пишет
+             в его чат, и сам выходит после IDLE_TIMEOUT_MINUTES минут тишины.
+  - manual — бот заходит/выходит только по командам !join / !leave; сообщения
+             озвучиваются, только пока бот уже сидит в этом канале.
+
+Логика озвучки:
+  1. Игрок из списка (allowed_users.json) пишет в ЧАТ голосового канала.
+  2. Если канал есть в списке отслеживаемых (TRACKED_CHANNEL_IDS) — текст
+     отправляется в очередь и проигрывается в этом канале.
+  3. Сообщения ставятся в очередь, чтобы не накладываться друг на друга.
 
 Особые случаи:
   - Сообщение, начинающееся с SKIP_PREFIX (по умолчанию "!"), не озвучивается.
   - Ссылки (http/https) вырезаются из текста перед озвучкой.
+
+Команды (COMMAND_PREFIX, по умолчанию "!"; доступны игрокам из списка и
+администраторам сервера):
+  - !join          — подключить бота к текущему голосовому каналу;
+  - !leave / !stop — отключить бота от голосового канала;
+  - !mode          — показать текущий режим;
+  - !mode auto | !mode manual — переключить режим.
 """
 
 import io
 import os
 import re
 import json
+import time
 import asyncio
 import logging
 
@@ -41,6 +53,20 @@ TTS_LANG = os.getenv("TTS_LANG", "ru")
 ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", "allowed_users.json")
 VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() not in ("0", "false", "no")
 SKIP_PREFIX = os.getenv("SKIP_PREFIX", "!")
+COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!")
+
+# Режим подключения по умолчанию: auto | manual.
+DEFAULT_MODE = os.getenv("CONNECTION_MODE", "auto").strip().lower()
+if DEFAULT_MODE not in ("auto", "manual"):
+    DEFAULT_MODE = "auto"
+
+# Сколько минут тишины в авто-режиме до авто-выхода из канала.
+try:
+    IDLE_TIMEOUT_MIN = float(os.getenv("IDLE_TIMEOUT_MINUTES", "10"))
+except ValueError:
+    IDLE_TIMEOUT_MIN = 10.0
+IDLE_TIMEOUT_SEC = IDLE_TIMEOUT_MIN * 60
+IDLE_CHECK_INTERVAL = 15  # как часто проверять бездействие, сек
 
 # ID голосовых каналов, чьи чаты отслеживаем. Пусто -> все voice-каналы.
 TRACKED_CHANNEL_IDS = {
@@ -78,6 +104,23 @@ class TTSBot(discord.Client):
         # Очередь и worker-задача на каждый сервер (guild).
         self._queues: dict[int, asyncio.Queue] = {}
         self._workers: dict[int, asyncio.Task] = {}
+        # Режим подключения и время последней активности на каждый сервер.
+        self._modes: dict[int, str] = {}
+        self._last_activity: dict[int, float] = {}
+
+    async def setup_hook(self):
+        # Фоновая проверка бездействия для авто-выхода.
+        self.loop.create_task(self._idle_check_loop())
+
+    # --- режим ------------------------------------------------------------
+    def get_mode(self, guild_id: int) -> str:
+        return self._modes.get(guild_id, DEFAULT_MODE)
+
+    def set_mode(self, guild_id: int, mode: str):
+        self._modes[guild_id] = mode
+
+    def touch_activity(self, guild_id: int):
+        self._last_activity[guild_id] = time.monotonic()
 
     # --- проверка прав ----------------------------------------------------
     def is_allowed(self, member: discord.abc.User) -> bool:
@@ -90,9 +133,16 @@ class TTSBot(discord.Client):
             return True
         return False
 
+    def can_use_commands(self, member: discord.abc.User) -> bool:
+        if self.is_allowed(member):
+            return True
+        perms = getattr(member, "guild_permissions", None)
+        return bool(perms and (perms.administrator or perms.manage_channels))
+
     # --- события ----------------------------------------------------------
     async def on_ready(self):
-        log.info("Бот запущен как %s (id=%s)", self.user, self.user.id)
+        log.info("Бот запущен как %s (id=%s). Режим по умолчанию: %s, таймаут: %g мин",
+                 self.user, self.user.id, DEFAULT_MODE, IDLE_TIMEOUT_MIN)
 
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
@@ -102,16 +152,22 @@ class TTSBot(discord.Client):
         if not isinstance(message.channel, discord.VoiceChannel):
             return
 
-        # Если задан список каналов — реагируем только на них.
+        raw = message.content.strip()
+        if not raw:
+            return  # одни вложения/эмодзи без текста — нечего озвучивать
+
+        # Команды управления обрабатываем до фильтра по списку каналов,
+        # чтобы можно было призвать бота в любой голосовой канал.
+        if COMMAND_PREFIX and raw.startswith(COMMAND_PREFIX):
+            if await self._handle_command(message, raw):
+                return  # это была команда — не озвучиваем
+
+        # Если задан список каналов — озвучиваем только в них.
         if TRACKED_CHANNEL_IDS and str(message.channel.id) not in TRACKED_CHANNEL_IDS:
             return
 
         if not self.is_allowed(message.author):
             return
-
-        raw = message.content.strip()
-        if not raw:
-            return  # одни вложения/эмодзи без текста — нечего озвучивать
 
         # Префикс "не озвучивать": сообщение остаётся в чате, но не читается.
         if SKIP_PREFIX and raw.startswith(SKIP_PREFIX):
@@ -124,9 +180,79 @@ class TTSBot(discord.Client):
         if len(text) > MAX_TTS_CHARS:
             text = text[:MAX_TTS_CHARS]
 
-        # Заходим в тот голосовой канал, в чате которого написали.
-        queue = self._get_queue(message.guild.id)
+        guild_id = message.guild.id
+        if self.get_mode(guild_id) == "manual":
+            # В ручном режиме озвучиваем, только если бот уже сидит в этом канале.
+            vc = message.guild.voice_client
+            if not (vc and vc.is_connected() and vc.channel.id == message.channel.id):
+                return
+
+        # Фиксируем активность (для авто-выхода по таймауту).
+        self.touch_activity(guild_id)
+
+        queue = self._get_queue(guild_id)
         await queue.put((message.channel, message.author.display_name, text))
+
+    # --- команды ----------------------------------------------------------
+    async def _handle_command(self, message: discord.Message, raw: str) -> bool:
+        """Возвращает True, если строка была распознана как команда."""
+        body = raw[len(COMMAND_PREFIX):].strip()
+        parts = body.split()
+        if not parts:
+            return False
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        if cmd not in ("join", "leave", "stop", "mode"):
+            return False  # не наша команда — пусть обрабатывается как обычный текст
+
+        if not self.can_use_commands(message.author):
+            await self._reply(message, "Недостаточно прав для этой команды.")
+            return True
+
+        guild = message.guild
+        channel = message.channel  # это VoiceChannel (проверено в on_message)
+
+        if cmd == "join":
+            try:
+                await self._ensure_connected(channel)
+                self.touch_activity(guild.id)
+                await self._reply(message, f"Подключился к «{channel.name}».")
+            except Exception as e:
+                log.exception("Не удалось подключиться")
+                await self._reply(message, f"Не удалось подключиться: {e}")
+            return True
+
+        if cmd in ("leave", "stop"):
+            vc = guild.voice_client
+            if vc and vc.is_connected():
+                await vc.disconnect(force=False)
+                await self._reply(message, "Отключился от голосового канала.")
+            else:
+                await self._reply(message, "Я не в голосовом канале.")
+            return True
+
+        if cmd == "mode":
+            if not args:
+                await self._reply(message, f"Текущий режим: **{self.get_mode(guild.id)}**.")
+                return True
+            new_mode = args[0].lower()
+            if new_mode not in ("auto", "manual"):
+                await self._reply(message, "Используйте: `!mode auto` или `!mode manual`.")
+                return True
+            self.set_mode(guild.id, new_mode)
+            if new_mode == "auto":
+                self.touch_activity(guild.id)
+            await self._reply(message, f"Режим переключён на **{new_mode}**.")
+            return True
+
+        return False
+
+    async def _reply(self, message: discord.Message, text: str):
+        try:
+            await message.channel.send(text)
+        except discord.HTTPException:
+            log.warning("Не удалось отправить ответ в чат")
 
     # --- очередь воспроизведения -----------------------------------------
     def _get_queue(self, guild_id: int) -> asyncio.Queue:
@@ -177,6 +303,38 @@ class TTSBot(discord.Client):
                 await vc.move_to(channel)
             return vc
         return await channel.connect()
+
+    # --- авто-выход по бездействию ----------------------------------------
+    async def _idle_check_loop(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self._check_idle_once()
+            except Exception:
+                log.exception("Ошибка проверки бездействия")
+            await asyncio.sleep(IDLE_CHECK_INTERVAL)
+
+    async def _check_idle_once(self):
+        now = time.monotonic()
+        for guild in self.guilds:
+            vc = guild.voice_client
+            if not (vc and vc.is_connected()):
+                continue
+            # Авто-выход работает только в авто-режиме.
+            if self.get_mode(guild.id) != "auto":
+                continue
+            # Не выходим, пока что-то проигрывается или ждёт в очереди.
+            if vc.is_playing():
+                self.touch_activity(guild.id)
+                continue
+            q = self._queues.get(guild.id)
+            if q and not q.empty():
+                continue
+            last = self._last_activity.get(guild.id, now)
+            if now - last >= IDLE_TIMEOUT_SEC:
+                log.info("Авто-выход из «%s»: тишина %g мин",
+                         vc.channel.name, IDLE_TIMEOUT_MIN)
+                await vc.disconnect(force=False)
 
 
 def main():
