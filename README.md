@@ -55,6 +55,9 @@ pip install -r requirements.txt
 python bot.py
 ```
 
+> Запуск на сервере Ubuntu (с автозапуском через systemd) описан в
+> [DEPLOY_UBUNTU.md](DEPLOY_UBUNTU.md).
+
 ## Про TLS-сертификат Сбера
 
 Сервер авторизации `ngw.devices.sberbank.ru` использует сертификат, выпущенный
