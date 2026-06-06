@@ -1,0 +1,13 @@
+# Секреты и настройки окружения
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
