@@ -357,7 +357,7 @@ def main():
     intents = discord.Intents.default()
     intents.message_content = True  # ОБЯЗАТЕЛЬНО включить в Developer Portal
     intents.voice_states = True
-    intents.members = True
+    # intents.members не нужен: автор сообщения и так приходит как Member.
 
     bot = TTSBot(tts, allowed_ids, allowed_names, intents=intents)
     bot.run(DISCORD_TOKEN)
