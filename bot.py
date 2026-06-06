@@ -21,7 +21,8 @@
   - !join          — подключить бота к текущему голосовому каналу;
   - !leave / !stop — отключить бота от голосового канала;
   - !mode          — показать текущий режим;
-  - !mode auto | !mode manual — переключить режим.
+  - !mode auto | !mode manual — переключить режим;
+  - !balance       — показать остаток символов/пакетов SaluteSpeech.
 """
 
 import io
@@ -235,7 +236,7 @@ class TTSBot(discord.Client):
         cmd = parts[0].lower()
         args = parts[1:]
 
-        if cmd not in ("join", "leave", "stop", "mode"):
+        if cmd not in ("join", "leave", "stop", "mode", "balance"):
             return False  # не наша команда — пусть обрабатывается как обычный текст
 
         if not self.can_use_commands(message.author):
@@ -276,6 +277,29 @@ class TTSBot(discord.Client):
             if new_mode == "auto":
                 self.touch_activity(guild.id)
             await self._reply(message, f"Режим переключён на **{new_mode}**.")
+            return True
+
+        if cmd == "balance":
+            try:
+                items = await self.tts.get_balance()
+            except SaluteTTSError as e:
+                await self._reply(
+                    message,
+                    "Не удалось получить баланс (вероятно, недоступен на текущем "
+                    f"тарифе): {e}")
+                return True
+            if not items:
+                await self._reply(message, "Баланс пуст или недоступен на этом тарифе.")
+                return True
+            lines = []
+            for it in items:
+                if isinstance(it, dict):
+                    key = it.get("key") or it.get("packageName") or "пакет"
+                    val = it.get("value", it.get("balance", "?"))
+                    lines.append(f"• {key}: **{val}**")
+                else:
+                    lines.append(f"• {it}")
+            await self._reply(message, "Остаток символов/пакетов:\n" + "\n".join(lines))
             return True
 
         return False

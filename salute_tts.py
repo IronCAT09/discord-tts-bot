@@ -46,6 +46,7 @@ def check_auth_key(key: str) -> str | None:
 
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 SYNTH_URL = "https://smartspeech.sber.ru/rest/v1/text:synthesize"
+BALANCE_URL = "https://smartspeech.sber.ru/rest/v1/balance"
 
 
 class SaluteTTSError(Exception):
@@ -163,3 +164,28 @@ class SaluteTTS:
                     raise SaluteTTSError(
                         f"Синтез вернул {resp.status}: {content[:300]!r}")
                 return content
+
+    # --- Баланс ------------------------------------------------------------
+    async def get_balance(self) -> list[dict]:
+        """Возвращает остаток пакетов (список {key, value}).
+
+        Метод доступен не на всех тарифах: на бесплатном персональном
+        SaluteSpeech может вернуть 401/403/404 — тогда бросаем SaluteTTSError.
+        """
+        token = await self._ensure_token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(BALANCE_URL, headers=headers,
+                                    ssl=self._ssl_ctx()) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    raise SaluteTTSError(f"Баланс вернул {resp.status}: {body[:300]}")
+                payload = await resp.json(content_type=None)
+
+        # Ответ обычно вида {"balance": [{"key": "...", "value": 123}, ...]}.
+        if isinstance(payload, dict) and "balance" in payload:
+            return payload["balance"] or []
+        if isinstance(payload, list):
+            return payload
+        return [payload]
