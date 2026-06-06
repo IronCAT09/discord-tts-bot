@@ -1,5 +1,6 @@
 # Секреты и настройки окружения
 .env
+salute_keys.json
 
 # Логи
 bot.log

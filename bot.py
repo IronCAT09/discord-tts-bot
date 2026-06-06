@@ -22,7 +22,11 @@
   - !leave / !stop — отключить бота от голосового канала;
   - !mode          — показать текущий режим;
   - !mode auto | !mode manual — переключить режим;
-  - !balance       — показать остаток символов/пакетов SaluteSpeech.
+  - !balance       — показать остаток символов/пакетов по всем ключам.
+
+Несколько ключей SaluteSpeech (salute_keys.json) дают авто-переключение:
+когда у активного ключа кончается баланс (HTTP 401/402/403/429), бот сам
+берёт следующий рабочий ключ.
 """
 
 import io
@@ -37,7 +41,9 @@ from logging.handlers import RotatingFileHandler
 import discord
 from dotenv import load_dotenv
 
-from salute_tts import SaluteTTS, SaluteTTSError, sanitize_auth_key, check_auth_key
+from salute_tts import (
+    SaluteTTS, SaluteTTSPool, SaluteTTSError, sanitize_auth_key, check_auth_key,
+)
 
 load_dotenv()
 
@@ -62,6 +68,8 @@ log = logging.getLogger("bot")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SALUTE_AUTH_KEY = os.getenv("SALUTE_AUTH_KEY")
 SALUTE_SCOPE = os.getenv("SALUTE_SCOPE", "SALUTE_SPEECH_PERS")
+# Файл с несколькими ключами (для авто-переключения при исчерпании баланса).
+SALUTE_KEYS_FILE = os.getenv("SALUTE_KEYS_FILE", "salute_keys.json")
 TTS_VOICE = os.getenv("TTS_VOICE", "Nec_24000")
 TTS_LANG = os.getenv("TTS_LANG", "ru")
 ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", "allowed_users.json")
@@ -109,8 +117,34 @@ def load_allowed_users(path: str):
     return ids, names
 
 
+def load_salute_keys() -> list[tuple[str, str]]:
+    """Возвращает список (auth_key, scope) ключей SaluteSpeech.
+
+    Источник — файл SALUTE_KEYS_FILE, если он есть, иначе одиночный
+    SALUTE_AUTH_KEY из .env. Формат файла:
+        {"keys": [
+            {"auth_key": "...", "scope": "SALUTE_SPEECH_PERS"},
+            "просто_ключ_строкой"   # scope возьмётся из SALUTE_SCOPE
+        ]}
+    """
+    keys: list[tuple[str, str]] = []
+    if SALUTE_KEYS_FILE and os.path.exists(SALUTE_KEYS_FILE):
+        with open(SALUTE_KEYS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for item in data.get("keys", []):
+            if isinstance(item, str):
+                keys.append((item, SALUTE_SCOPE))
+            elif isinstance(item, dict) and item.get("auth_key"):
+                keys.append((item["auth_key"], item.get("scope", SALUTE_SCOPE)))
+        log.info("Загружено %d ключ(ей) SaluteSpeech из %s", len(keys), SALUTE_KEYS_FILE)
+    elif SALUTE_AUTH_KEY:
+        keys.append((SALUTE_AUTH_KEY, SALUTE_SCOPE))
+        log.info("Использую одиночный SALUTE_AUTH_KEY из .env")
+    return keys
+
+
 class TTSBot(discord.Client):
-    def __init__(self, tts: SaluteTTS, allowed_ids, allowed_names, **kwargs):
+    def __init__(self, tts, allowed_ids, allowed_names, **kwargs):
         super().__init__(**kwargs)
         self.tts = tts
         self.allowed_ids = allowed_ids
@@ -280,26 +314,30 @@ class TTSBot(discord.Client):
             return True
 
         if cmd == "balance":
-            try:
-                items = await self.tts.get_balance()
-            except SaluteTTSError as e:
-                await self._reply(
-                    message,
-                    "Не удалось получить баланс (вероятно, недоступен на текущем "
-                    f"тарифе): {e}")
-                return True
-            if not items:
-                await self._reply(message, "Баланс пуст или недоступен на этом тарифе.")
-                return True
+            rows = await self.tts.get_balances()
             lines = []
-            for it in items:
-                if isinstance(it, dict):
-                    key = it.get("key") or it.get("packageName") or "пакет"
-                    val = it.get("value", it.get("balance", "?"))
-                    lines.append(f"• {key}: **{val}**")
+            for row in rows:
+                mark = " (активный)" if row.get("active") else ""
+                if row.get("exhausted"):
+                    mark += " [исчерпан]"
+                head = f"Ключ #{row['index']}{mark}:"
+                if "error" in row:
+                    lines.append(f"{head} баланс недоступен ({row['error']})")
                 else:
-                    lines.append(f"• {it}")
-            await self._reply(message, "Остаток символов/пакетов:\n" + "\n".join(lines))
+                    items = row.get("balance") or []
+                    if not items:
+                        lines.append(f"{head} пусто")
+                    else:
+                        parts = []
+                        for it in items:
+                            if isinstance(it, dict):
+                                k = it.get("key") or it.get("packageName") or "пакет"
+                                v = it.get("value", it.get("balance", "?"))
+                                parts.append(f"{k}={v}")
+                            else:
+                                parts.append(str(it))
+                        lines.append(f"{head} " + ", ".join(parts))
+            await self._reply(message, "**Баланс ключей SaluteSpeech:**\n" + "\n".join(lines))
             return True
 
         return False
@@ -422,8 +460,6 @@ class TTSBot(discord.Client):
 def main():
     if not DISCORD_TOKEN:
         raise SystemExit("Не задан DISCORD_TOKEN (см. .env.example)")
-    if not SALUTE_AUTH_KEY:
-        raise SystemExit("Не задан SALUTE_AUTH_KEY (см. .env.example)")
 
     # Голос в Discord требует PyNaCl. Без него бот не сможет зайти в канал.
     try:
@@ -432,23 +468,28 @@ def main():
         log.warning("PyNaCl не установлен — подключение к голосу НЕ заработает. "
                     "Установите: pip install -r requirements.txt (или pip install PyNaCl)")
 
-    # Диагностика ключа SaluteSpeech (не печатаем сам секрет).
-    clean_key = sanitize_auth_key(SALUTE_AUTH_KEY)
-    log.info("SALUTE_AUTH_KEY: длина %d, scope=%s", len(clean_key), SALUTE_SCOPE)
-    warn = check_auth_key(clean_key)
-    if warn:
-        log.warning("Проверьте SALUTE_AUTH_KEY: %s", warn)
+    keys = load_salute_keys()
+    if not keys:
+        raise SystemExit("Не задан ни один ключ SaluteSpeech "
+                         "(SALUTE_AUTH_KEY в .env или salute_keys.json)")
+
+    # Диагностика ключей (сам секрет не печатаем).
+    for i, (k, scope) in enumerate(keys, 1):
+        clean = sanitize_auth_key(k)
+        warn = check_auth_key(clean)
+        log.info("Ключ #%d: длина %d, scope=%s%s",
+                 i, len(clean), scope, "" if not warn else f" — ВНИМАНИЕ: {warn}")
 
     allowed_ids, allowed_names = load_allowed_users(ALLOWED_USERS_FILE)
 
-    tts = SaluteTTS(
-        auth_key=SALUTE_AUTH_KEY,
-        scope=SALUTE_SCOPE,
+    tts = SaluteTTSPool(
+        keys=keys,
         voice=TTS_VOICE,
         lang=TTS_LANG,
         audio_format="pcm16",
         verify_ssl=VERIFY_SSL,
     )
+    log.info("Пул SaluteSpeech: %d ключ(ей)", tts.size)
 
     intents = discord.Intents.default()
     intents.message_content = True  # ОБЯЗАТЕЛЬНО включить в Developer Portal

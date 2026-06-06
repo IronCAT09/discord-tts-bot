@@ -50,7 +50,15 @@ BALANCE_URL = "https://smartspeech.sber.ru/rest/v1/balance"
 
 
 class SaluteTTSError(Exception):
-    """Ошибка обращения к SaluteSpeech."""
+    """Ошибка обращения к SaluteSpeech. status — HTTP-код ответа (если есть)."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+# HTTP-коды, при которых считаем ключ исчерпанным/недоступным и пробуем другой.
+ROTATE_STATUSES = {401, 402, 403, 429}
 
 
 class SaluteTTS:
@@ -114,7 +122,7 @@ class SaluteTTS:
                     body = await resp.text()
                     if resp.status != 200:
                         raise SaluteTTSError(
-                            f"OAuth вернул {resp.status}: {body}")
+                            f"OAuth вернул {resp.status}: {body}", status=resp.status)
                     payload = await resp.json(content_type=None)
 
             self._access_token = payload["access_token"]
@@ -158,11 +166,13 @@ class SaluteTTS:
                         content = await resp2.read()
                         if resp2.status != 200:
                             raise SaluteTTSError(
-                                f"Синтез вернул {resp2.status}: {content[:300]!r}")
+                                f"Синтез вернул {resp2.status}: {content[:300]!r}",
+                                status=resp2.status)
                         return content
                 if resp.status != 200:
                     raise SaluteTTSError(
-                        f"Синтез вернул {resp.status}: {content[:300]!r}")
+                        f"Синтез вернул {resp.status}: {content[:300]!r}",
+                        status=resp.status)
                 return content
 
     # --- Баланс ------------------------------------------------------------
@@ -180,7 +190,8 @@ class SaluteTTS:
                                     ssl=self._ssl_ctx()) as resp:
                 body = await resp.text()
                 if resp.status != 200:
-                    raise SaluteTTSError(f"Баланс вернул {resp.status}: {body[:300]}")
+                    raise SaluteTTSError(f"Баланс вернул {resp.status}: {body[:300]}",
+                                         status=resp.status)
                 payload = await resp.json(content_type=None)
 
         # Ответ обычно вида {"balance": [{"key": "...", "value": 123}, ...]}.
@@ -189,3 +200,84 @@ class SaluteTTS:
         if isinstance(payload, list):
             return payload
         return [payload]
+
+
+class SaluteTTSPool:
+    """Несколько ключей SaluteSpeech с авто-переключением при исчерпании баланса.
+
+    Запросы идут через активный ключ; если он отвечает кодом из ROTATE_STATUSES
+    (исчерпан/заблокирован/лимит), ключ помечается исчерпанным и берётся
+    следующий рабочий. Когда все исчерпаны — бросается SaluteTTSError.
+    """
+
+    def __init__(self, keys: list[tuple[str, str]], voice: str = "Nec_24000",
+                 lang: str = "ru", audio_format: str = "pcm16",
+                 verify_ssl: bool = True):
+        if not keys:
+            raise ValueError("Нужен хотя бы один ключ SaluteSpeech")
+        self._clients = [
+            SaluteTTS(auth_key=k, scope=s, voice=voice, lang=lang,
+                      audio_format=audio_format, verify_ssl=verify_ssl)
+            for k, s in keys
+        ]
+        self._exhausted = [False] * len(self._clients)
+        self._active = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def audio_format(self) -> str:
+        return self._clients[0].audio_format
+
+    @property
+    def sample_rate(self) -> int:
+        return self._clients[0].sample_rate
+
+    @property
+    def size(self) -> int:
+        return len(self._clients)
+
+    @property
+    def active_index(self) -> int:
+        return self._active
+
+    def reset_exhausted(self):
+        """Снять пометку «исчерпан» со всех ключей (например, после пополнения)."""
+        self._exhausted = [False] * len(self._clients)
+
+    async def synthesize(self, text: str) -> bytes:
+        n = len(self._clients)
+        last_err: SaluteTTSError | None = None
+        async with self._lock:
+            for offset in range(n):
+                idx = (self._active + offset) % n
+                if self._exhausted[idx]:
+                    continue
+                try:
+                    data = await self._clients[idx].synthesize(text)
+                    self._active = idx  # запоминаем рабочий ключ
+                    return data
+                except SaluteTTSError as e:
+                    if e.status in ROTATE_STATUSES:
+                        log.warning("Ключ #%d недоступен (HTTP %s) — переключаюсь "
+                                    "на следующий", idx + 1, e.status)
+                        self._exhausted[idx] = True
+                        last_err = e
+                        continue
+                    raise  # ошибка не про баланс — пробрасываем
+        raise SaluteTTSError(
+            "Все ключи SaluteSpeech исчерпаны или недоступны"
+            + (f" (последняя ошибка: {last_err})" if last_err else ""))
+
+    async def get_balances(self) -> list[dict]:
+        """Возвращает по строке на каждый ключ: индекс, активность, баланс/ошибка."""
+        result = []
+        for i, client in enumerate(self._clients):
+            row = {"index": i + 1, "active": i == self._active,
+                   "exhausted": self._exhausted[i]}
+            try:
+                row["balance"] = await client.get_balance()
+            except SaluteTTSError as e:
+                row["error"] = str(e)
+                row["status"] = e.status
+            result.append(row)
+        return result

@@ -1,0 +1,8 @@
+{
+  "_comment": "Скопируйте в salute_keys.json и впишите свои ключи. Бот переключается на следующий ключ, когда у текущего кончается баланс. Можно указывать ключ строкой (scope берётся из SALUTE_SCOPE в .env) или объектом со своим scope.",
+  "keys": [
+    { "auth_key": "ПЕРВЫЙ_AUTHORIZATION_KEY_BASE64==", "scope": "SALUTE_SPEECH_PERS" },
+    { "auth_key": "ВТОРОЙ_AUTHORIZATION_KEY_BASE64==", "scope": "SALUTE_SPEECH_PERS" },
+    "ТРЕТИЙ_КЛЮЧ_СТРОКОЙ_BASE64=="
+  ]
+}
