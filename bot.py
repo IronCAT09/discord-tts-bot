@@ -31,19 +31,32 @@ import json
 import time
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 
 import discord
 from dotenv import load_dotenv
 
 from salute_tts import SaluteTTS, SaluteTTSError
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("bot")
-
 load_dotenv()
+
+# Логи пишутся и в консоль, и в файл (LOG_FILE, по умолчанию bot.log).
+# Уровень настраивается через LOG_LEVEL (INFO/DEBUG/...).
+LOG_FILE = os.getenv("LOG_FILE", "bot.log")
+LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+_handlers = [logging.StreamHandler()]
+if LOG_FILE:
+    # Файл с ротацией: до 2 МБ, 3 архивных копии.
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3,
+                              encoding="utf-8")
+    _handlers.append(_fh)
+for _h in _handlers:
+    _h.setFormatter(_fmt)
+logging.basicConfig(level=LOG_LEVEL, handlers=_handlers)
+
+log = logging.getLogger("bot")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SALUTE_AUTH_KEY = os.getenv("SALUTE_AUTH_KEY")

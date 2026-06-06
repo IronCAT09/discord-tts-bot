@@ -1,6 +1,11 @@
 # Секреты и настройки окружения
 .env
 
+# Логи
+bot.log
+bot.log.*
+*.log
+
 # Python
 __pycache__/
 *.py[cod]
