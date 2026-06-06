@@ -156,17 +156,17 @@ class TTSBot(discord.Client):
     async def on_ready(self):
         log.info("Бот запущен как %s (id=%s). Режим по умолчанию: %s, таймаут: %g мин",
                  self.user, self.user.id, DEFAULT_MODE, IDLE_TIMEOUT_MIN)
-        # Проверяем права в отслеживаемых голосовых каналах.
+        log.info("TRACKED_CHANNEL_IDS = %s",
+                 sorted(TRACKED_CHANNEL_IDS) or "(пусто — слушаю все голосовые)")
+        # Выводим ВСЕ голосовые каналы, их ID, отслеживание и права.
         for guild in self.guilds:
+            log.info("Сервер «%s» (id=%s):", guild.name, guild.id)
             for ch in guild.voice_channels:
-                if TRACKED_CHANNEL_IDS and str(ch.id) not in TRACKED_CHANNEL_IDS:
-                    continue
+                tracked = (not TRACKED_CHANNEL_IDS) or str(ch.id) in TRACKED_CHANNEL_IDS
                 missing = self._check_voice_perms(ch)
-                if missing:
-                    log.warning("Канал «%s» (id=%s): не хватает прав — %s",
-                                ch.name, ch.id, ", ".join(missing))
-                else:
-                    log.info("Канал «%s» (id=%s): права в порядке.", ch.name, ch.id)
+                log.info("  voice «%s» id=%s | отслеживается=%s | %s",
+                         ch.name, ch.id, "да" if tracked else "нет",
+                         "права OK" if not missing else "НЕТ ПРАВ: " + ", ".join(missing))
 
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
