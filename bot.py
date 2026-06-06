@@ -36,7 +36,7 @@ from logging.handlers import RotatingFileHandler
 import discord
 from dotenv import load_dotenv
 
-from salute_tts import SaluteTTS, SaluteTTSError
+from salute_tts import SaluteTTS, SaluteTTSError, sanitize_auth_key, check_auth_key
 
 load_dotenv()
 
@@ -401,6 +401,13 @@ def main():
     except ImportError:
         log.warning("PyNaCl не установлен — подключение к голосу НЕ заработает. "
                     "Установите: pip install -r requirements.txt (или pip install PyNaCl)")
+
+    # Диагностика ключа SaluteSpeech (не печатаем сам секрет).
+    clean_key = sanitize_auth_key(SALUTE_AUTH_KEY)
+    log.info("SALUTE_AUTH_KEY: длина %d, scope=%s", len(clean_key), SALUTE_SCOPE)
+    warn = check_auth_key(clean_key)
+    if warn:
+        log.warning("Проверьте SALUTE_AUTH_KEY: %s", warn)
 
     allowed_ids, allowed_names = load_allowed_users(ALLOWED_USERS_FILE)
 

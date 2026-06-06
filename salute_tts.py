@@ -6,6 +6,8 @@
 """
 
 import asyncio
+import base64
+import binascii
 import ssl
 import time
 import uuid
@@ -15,6 +17,31 @@ from xml.sax.saxutils import escape
 import aiohttp
 
 log = logging.getLogger("salute")
+
+
+def sanitize_auth_key(key: str) -> str:
+    """Чистит Authorization key от кавычек, пробелов и префикса 'Basic '."""
+    key = (key or "").strip().strip('"').strip("'").strip()
+    if key.lower().startswith("basic "):
+        key = key[6:].strip()
+    return key
+
+
+def check_auth_key(key: str) -> str | None:
+    """Возвращает текст предупреждения, если ключ выглядит подозрительно, иначе None."""
+    if not key:
+        return "ключ пустой"
+    try:
+        decoded = base64.b64decode(key, validate=True)
+    except (binascii.Error, ValueError):
+        return ("значение не является корректным base64 — похоже, это не "
+                "Authorization key. Возьмите готовый ключ из личного кабинета "
+                "(Client ID:Client Secret в base64).")
+    if b":" not in decoded:
+        return ("после декодирования base64 нет символа ':' — вероятно, вставлен "
+                "только Client ID или Client Secret, а нужен Authorization key "
+                "(base64 от 'Client ID:Client Secret').")
+    return None
 
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 SYNTH_URL = "https://smartspeech.sber.ru/rest/v1/text:synthesize"
@@ -28,7 +55,7 @@ class SaluteTTS:
     def __init__(self, auth_key: str, scope: str = "SALUTE_SPEECH_PERS",
                  voice: str = "Nec_24000", lang: str = "ru",
                  audio_format: str = "wav16", verify_ssl: bool = True):
-        self._auth_key = auth_key
+        self._auth_key = sanitize_auth_key(auth_key)
         self._scope = scope
         self._voice = voice
         self._lang = lang
