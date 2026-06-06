@@ -150,6 +150,8 @@ class TTSBot(discord.Client):
 
         # Отслеживаем только ЧАТ голосового канала (встроенный текстовый чат).
         if not isinstance(message.channel, discord.VoiceChannel):
+            log.debug("Сообщение не в чате голосового канала (%s) — пропуск",
+                      type(message.channel).__name__)
             return
 
         raw = message.content.strip()
@@ -164,9 +166,13 @@ class TTSBot(discord.Client):
 
         # Если задан список каналов — озвучиваем только в них.
         if TRACKED_CHANNEL_IDS and str(message.channel.id) not in TRACKED_CHANNEL_IDS:
+            log.info("Канал %s (id=%s) не в TRACKED_CHANNEL_IDS — пропуск",
+                     message.channel.name, message.channel.id)
             return
 
         if not self.is_allowed(message.author):
+            log.info("Автор %s (id=%s) не в списке разрешённых — пропуск",
+                     message.author, message.author.id)
             return
 
         # Префикс "не озвучивать": сообщение остаётся в чате, но не читается.
@@ -185,6 +191,8 @@ class TTSBot(discord.Client):
             # В ручном режиме озвучиваем, только если бот уже сидит в этом канале.
             vc = message.guild.voice_client
             if not (vc and vc.is_connected() and vc.channel.id == message.channel.id):
+                log.info("Ручной режим: бот не в канале %s — пропуск (используйте !join)",
+                         message.channel.name)
                 return
 
         # Фиксируем активность (для авто-выхода по таймауту).
@@ -342,6 +350,13 @@ def main():
         raise SystemExit("Не задан DISCORD_TOKEN (см. .env.example)")
     if not SALUTE_AUTH_KEY:
         raise SystemExit("Не задан SALUTE_AUTH_KEY (см. .env.example)")
+
+    # Голос в Discord требует PyNaCl. Без него бот не сможет зайти в канал.
+    try:
+        import nacl  # noqa: F401
+    except ImportError:
+        log.warning("PyNaCl не установлен — подключение к голосу НЕ заработает. "
+                    "Установите: pip install -r requirements.txt (или pip install PyNaCl)")
 
     allowed_ids, allowed_names = load_allowed_users(ALLOWED_USERS_FILE)
 
