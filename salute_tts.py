@@ -8,6 +8,7 @@
 import asyncio
 import base64
 import binascii
+import re
 import ssl
 import time
 import uuid
@@ -65,6 +66,16 @@ class SaluteTTS:
         self._access_token: str | None = None
         self._token_exp_ms: int = 0          # время истечения (unix ms)
         self._token_lock = asyncio.Lock()    # чтобы токен обновлял только один корутин
+
+    @property
+    def audio_format(self) -> str:
+        return self._format
+
+    @property
+    def sample_rate(self) -> int:
+        """Частота дискретизации из имени голоса (Nec_24000 -> 24000), иначе 24000."""
+        m = re.search(r"_(\d+)$", self._voice)
+        return int(m.group(1)) if m else 24000
 
     # --- TLS ---------------------------------------------------------------
     def _ssl_ctx(self):

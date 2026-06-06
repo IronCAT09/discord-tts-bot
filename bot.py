@@ -318,8 +318,14 @@ class TTSBot(discord.Client):
         while vc.is_playing():
             await asyncio.sleep(0.1)
 
-        # wav16 декодируем через ffmpeg из памяти.
-        source = discord.FFmpegPCMAudio(io.BytesIO(audio), pipe=True)
+        # Декодируем через ffmpeg из памяти.
+        if self.tts.audio_format == "pcm16":
+            # Сырой PCM: явно указываем формат, частоту и моно — без WAV-заголовка.
+            before = f"-f s16le -ar {self.tts.sample_rate} -ac 1"
+            source = discord.FFmpegPCMAudio(io.BytesIO(audio), pipe=True,
+                                            before_options=before)
+        else:
+            source = discord.FFmpegPCMAudio(io.BytesIO(audio), pipe=True)
         done = asyncio.Event()
 
         def _after(err):
@@ -416,7 +422,7 @@ def main():
         scope=SALUTE_SCOPE,
         voice=TTS_VOICE,
         lang=TTS_LANG,
-        audio_format="wav16",
+        audio_format="pcm16",
         verify_ssl=VERIFY_SSL,
     )
 
