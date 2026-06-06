@@ -156,6 +156,17 @@ class TTSBot(discord.Client):
     async def on_ready(self):
         log.info("Бот запущен как %s (id=%s). Режим по умолчанию: %s, таймаут: %g мин",
                  self.user, self.user.id, DEFAULT_MODE, IDLE_TIMEOUT_MIN)
+        # Проверяем права в отслеживаемых голосовых каналах.
+        for guild in self.guilds:
+            for ch in guild.voice_channels:
+                if TRACKED_CHANNEL_IDS and str(ch.id) not in TRACKED_CHANNEL_IDS:
+                    continue
+                missing = self._check_voice_perms(ch)
+                if missing:
+                    log.warning("Канал «%s» (id=%s): не хватает прав — %s",
+                                ch.name, ch.id, ", ".join(missing))
+                else:
+                    log.info("Канал «%s» (id=%s): права в порядке.", ch.name, ch.id)
 
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
@@ -288,6 +299,8 @@ class TTSBot(discord.Client):
             channel, author_name, text = await queue.get()
             try:
                 await self._speak(channel, author_name, text)
+            except PermissionError as e:
+                log.error("Нет прав: %s. Выдайте боту права на канал в настройках.", e)
             except SaluteTTSError as e:
                 log.error("Ошибка SaluteSpeech: %s", e)
             except Exception:
@@ -317,7 +330,25 @@ class TTSBot(discord.Client):
         vc.play(source, after=_after)
         await done.wait()
 
+    def _check_voice_perms(self, channel: discord.VoiceChannel) -> list[str]:
+        """Возвращает список НЕДОСТАЮЩИХ прав бота для голоса в этом канале."""
+        me = channel.guild.me
+        perms = channel.permissions_for(me)
+        missing = []
+        if not perms.view_channel:
+            missing.append("Просмотр канала (View Channel)")
+        if not perms.connect:
+            missing.append("Подключение (Connect)")
+        if not perms.speak:
+            missing.append("Говорить (Speak)")
+        return missing
+
     async def _ensure_connected(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
+        missing = self._check_voice_perms(channel)
+        if missing:
+            raise PermissionError("не хватает прав на канале «%s»: %s"
+                                  % (channel.name, ", ".join(missing)))
+
         vc = channel.guild.voice_client
         if vc and vc.is_connected():
             if vc.channel.id != channel.id:
