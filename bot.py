@@ -22,7 +22,9 @@
   - !leave / !stop — отключить бота от голосового канала;
   - !mode          — показать текущий режим;
   - !mode auto | !mode manual — переключить режим;
-  - !balance       — показать остаток символов/пакетов по всем ключам.
+  - !balance       — показать остаток символов/пакетов по всем ключам;
+  - !speak <текст> — принудительно озвучить текст (только для заданных ролей,
+                     SPEAK_ROLE_IDS / SPEAK_ROLE_NAMES).
 
 Несколько ключей SaluteSpeech (salute_keys.json) дают авто-переключение:
 когда у активного ключа кончается баланс (HTTP 401/402/403/429), бот сам
@@ -76,6 +78,14 @@ ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", "allowed_users.json")
 VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() not in ("0", "false", "no")
 SKIP_PREFIX = os.getenv("SKIP_PREFIX", "!")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!")
+
+# Роли, которым разрешена команда !speak (по ID и/или названию, через запятую).
+SPEAK_ROLE_IDS = {
+    s.strip() for s in os.getenv("SPEAK_ROLE_IDS", "").split(",") if s.strip()
+}
+SPEAK_ROLE_NAMES = {
+    s.strip().lower() for s in os.getenv("SPEAK_ROLE_NAMES", "").split(",") if s.strip()
+}
 
 # Режим подключения по умолчанию: auto | manual.
 DEFAULT_MODE = os.getenv("CONNECTION_MODE", "auto").strip().lower()
@@ -187,6 +197,18 @@ class TTSBot(discord.Client):
         perms = getattr(member, "guild_permissions", None)
         return bool(perms and (perms.administrator or perms.manage_channels))
 
+    def can_speak_command(self, member: discord.abc.User) -> bool:
+        """!speak: разрешён администраторам и обладателям заданных ролей."""
+        perms = getattr(member, "guild_permissions", None)
+        if perms and (perms.administrator or perms.manage_channels):
+            return True
+        for role in getattr(member, "roles", []):
+            if str(role.id) in SPEAK_ROLE_IDS:
+                return True
+            if role.name.lower() in SPEAK_ROLE_NAMES:
+                return True
+        return False
+
     # --- события ----------------------------------------------------------
     async def on_ready(self):
         log.info("Бот запущен как %s (id=%s). Режим по умолчанию: %s, таймаут: %g мин",
@@ -270,15 +292,35 @@ class TTSBot(discord.Client):
         cmd = parts[0].lower()
         args = parts[1:]
 
-        if cmd not in ("join", "leave", "stop", "mode", "balance"):
+        if cmd not in ("join", "leave", "stop", "mode", "balance", "speak"):
             return False  # не наша команда — пусть обрабатывается как обычный текст
+
+        guild = message.guild
+        channel = message.channel  # это VoiceChannel (проверено в on_message)
+
+        # !speak — отдельная проверка прав (по ролям).
+        if cmd == "speak":
+            if not self.can_speak_command(message.author):
+                await self._reply(message, "Команда !speak доступна только пользователям "
+                                            "с разрешённой ролью.")
+                return True
+            # Берём весь текст после слова команды (с сохранением пробелов).
+            text = body[len(parts[0]):].strip()
+            text = clean_text(text)
+            if not text:
+                await self._reply(message, "Использование: `!speak <текст>`")
+                return True
+            if len(text) > MAX_TTS_CHARS:
+                text = text[:MAX_TTS_CHARS]
+            # Принудительная озвучка: worker сам подключит бота к каналу.
+            self.touch_activity(guild.id)
+            queue = self._get_queue(guild.id)
+            await queue.put((channel, message.author.display_name, text))
+            return True
 
         if not self.can_use_commands(message.author):
             await self._reply(message, "Недостаточно прав для этой команды.")
             return True
-
-        guild = message.guild
-        channel = message.channel  # это VoiceChannel (проверено в on_message)
 
         if cmd == "join":
             try:
