@@ -1,0 +1,8 @@
+{
+  "_comment": "Скопируйте в azure_keys.json и впишите свои ключи Azure Speech. Бот переключается на следующий ключ, когда у текущего кончается квота (401/403/429). Каждый ключ — это отдельный ресурс Speech в портале Azure: Keys and Endpoint -> KEY 1 и Location/Region. Поля region и voice необязательны: если их не указать, возьмутся AZURE_SPEECH_REGION и AZURE_VOICE из .env. Ключ можно указать и просто строкой.",
+  "keys": [
+    { "key": "ПЕРВЫЙ_КЛЮЧ_AZURE", "region": "westeurope" },
+    { "key": "ВТОРОЙ_КЛЮЧ_AZURE", "region": "germanywestcentral", "voice": "ru-RU-DmitryNeural" },
+    "ТРЕТИЙ_КЛЮЧ_СТРОКОЙ"
+  ]
+}

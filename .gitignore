@@ -17,3 +17,14 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Ключи Azure Speech
+azure_keys.json
+
+# Локальный счётчик израсходованных символов
+usage.json
+usage.json.tmp
+.env.bak*
+
+# Список игроков (содержит личные Discord ID)
+allowed_users.json

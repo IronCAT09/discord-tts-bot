@@ -17,6 +17,8 @@ from xml.sax.saxutils import escape
 
 import aiohttp
 
+from tts_base import ROTATE_STATUSES, TTSError
+
 log = logging.getLogger("salute")
 
 
@@ -49,16 +51,12 @@ SYNTH_URL = "https://smartspeech.sber.ru/rest/v1/text:synthesize"
 BALANCE_URL = "https://smartspeech.sber.ru/rest/v1/balance"
 
 
-class SaluteTTSError(Exception):
-    """Ошибка обращения к SaluteSpeech. status — HTTP-код ответа (если есть)."""
+class SaluteTTSError(TTSError):
+    """Ошибка обращения к SaluteSpeech. status — HTTP-код ответа (если есть).
 
-    def __init__(self, message: str, status: int | None = None):
-        super().__init__(message)
-        self.status = status
-
-
-# HTTP-коды, при которых считаем ключ исчерпанным/недоступным и пробуем другой.
-ROTATE_STATUSES = {401, 402, 403, 429}
+    Коды, при которых ключ считается исчерпанным и берётся следующий, —
+    в tts_base.ROTATE_STATUSES (общие для всех провайдеров).
+    """
 
 
 class SaluteTTS:
@@ -210,9 +208,11 @@ class SaluteTTSPool:
     следующий рабочий. Когда все исчерпаны — бросается SaluteTTSError.
     """
 
+    provider = "salute"
+
     def __init__(self, keys: list[tuple[str, str]], voice: str = "Nec_24000",
                  lang: str = "ru", audio_format: str = "pcm16",
-                 verify_ssl: bool = True):
+                 verify_ssl: bool = True, usage=None):
         if not keys:
             raise ValueError("Нужен хотя бы один ключ SaluteSpeech")
         self._clients = [
@@ -223,6 +223,8 @@ class SaluteTTSPool:
         self._exhausted = [False] * len(self._clients)
         self._active = 0
         self._lock = asyncio.Lock()
+        self._usage = usage
+        self._voice = voice
 
     @property
     def audio_format(self) -> str:
@@ -240,6 +242,14 @@ class SaluteTTSPool:
     def active_index(self) -> int:
         return self._active
 
+    def key_id(self, idx: int) -> str:
+        """Идентификатор ключа в файле счётчиков символов."""
+        return f"salute:{idx + 1}"
+
+    def describe(self) -> str:
+        return (f"SaluteSpeech: {self.size} ключ(ей), голос {self._voice}, "
+                f"формат {self.audio_format} {self.sample_rate} Гц")
+
     def reset_exhausted(self):
         """Снять пометку «исчерпан» со всех ключей (например, после пополнения)."""
         self._exhausted = [False] * len(self._clients)
@@ -255,6 +265,8 @@ class SaluteTTSPool:
                 try:
                     data = await self._clients[idx].synthesize(text)
                     self._active = idx  # запоминаем рабочий ключ
+                    if self._usage:
+                        self._usage.add(self.key_id(idx), len(text))
                     return data
                 except SaluteTTSError as e:
                     if e.status in ROTATE_STATUSES:
@@ -274,6 +286,9 @@ class SaluteTTSPool:
         for i, client in enumerate(self._clients):
             row = {"index": i + 1, "active": i == self._active,
                    "exhausted": self._exhausted[i]}
+            if self._usage:
+                row["used"] = self._usage.used(self.key_id(i))
+                row["month"] = self._usage.month
             try:
                 row["balance"] = await client.get_balance()
             except SaluteTTSError as e:

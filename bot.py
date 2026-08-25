@@ -1,4 +1,10 @@
-"""Discord-бот, который озвучивает сообщения определённых игроков через SaluteSpeech.
+"""Discord-бот, который озвучивает сообщения определённых игроков через TTS.
+
+Провайдер синтеза выбирается в .env переменной TTS_PROVIDER:
+  - azure  — Azure Cognitive Services Speech (основной, через официальный SDK);
+  - salute — SaluteSpeech (Сбер), оставлен как запасной вариант.
+Оба провайдера дают боту один и тот же интерфейс (см. tts_base.py), поэтому
+переключение — это одна строка в .env.
 
 Режимы подключения (CONNECTION_MODE, переключается командой !mode):
   - auto   — бот сам заходит в голосовой канал, когда игрок из списка пишет
@@ -22,13 +28,16 @@
   - !leave / !stop — отключить бота от голосового канала;
   - !mode          — показать текущий режим;
   - !mode auto | !mode manual — переключить режим;
-  - !balance       — показать остаток символов/пакетов по всем ключам;
+  - !balance       — показать расход символов / остаток пакетов по всем ключам;
   - !speak <текст> — принудительно озвучить текст (только для заданных ролей,
                      SPEAK_ROLE_IDS / SPEAK_ROLE_NAMES).
 
-Несколько ключей SaluteSpeech (salute_keys.json) дают авто-переключение:
-когда у активного ключа кончается баланс (HTTP 401/402/403/429), бот сам
-берёт следующий рабочий ключ.
+Несколько ключей (azure_keys.json / salute_keys.json) дают авто-переключение:
+когда у активного ключа кончается квота или он становится недоступен
+(401/403/429), бот сам берёт следующий рабочий ключ.
+
+У Azure нет API остатка средств, поэтому расход символов бот считает сам и
+хранит в USAGE_FILE (сброс при смене месяца) — это и показывает !balance.
 """
 
 import io
@@ -43,9 +52,12 @@ from logging.handlers import RotatingFileHandler
 import discord
 from dotenv import load_dotenv
 
-from salute_tts import (
-    SaluteTTS, SaluteTTSPool, SaluteTTSError, sanitize_auth_key, check_auth_key,
-)
+from tts_base import TTSError
+from usage import UsageTracker
+from salute_tts import SaluteTTSPool, sanitize_auth_key, check_auth_key
+# azure_tts не требует установленного SDK на импорте — он ругнётся только
+# при попытке создать пул, поэтому провайдер salute работает и без SDK.
+from azure_tts import DEFAULT_OUTPUT_FORMAT, DEFAULT_VOICE, AzureTTSPool
 
 load_dotenv()
 
@@ -68,12 +80,46 @@ logging.basicConfig(level=LOG_LEVEL, handlers=_handlers)
 log = logging.getLogger("bot")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+# Провайдер синтеза речи: azure (основной) | salute (запасной).
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "azure").strip().lower()
+if TTS_PROVIDER not in ("azure", "salute"):
+    TTS_PROVIDER = "azure"
+
+# --- Azure Speech ---------------------------------------------------------
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "")
+# Пользовательский endpoint нужен только для private/custom-развёртываний.
+AZURE_SPEECH_ENDPOINT = os.getenv("AZURE_SPEECH_ENDPOINT", "")
+# Файл с несколькими ключами Azure (для авто-переключения при исчерпании квоты).
+AZURE_KEYS_FILE = os.getenv("AZURE_KEYS_FILE", "azure_keys.json")
+AZURE_VOICE = os.getenv("AZURE_VOICE", DEFAULT_VOICE)
+AZURE_OUTPUT_FORMAT = os.getenv("AZURE_OUTPUT_FORMAT", DEFAULT_OUTPUT_FORMAT)
+# Необязательные украшения SSML (стиль поддерживают не все голоса).
+AZURE_VOICE_STYLE = os.getenv("AZURE_VOICE_STYLE", "")
+AZURE_VOICE_RATE = os.getenv("AZURE_VOICE_RATE", "")
+AZURE_VOICE_PITCH = os.getenv("AZURE_VOICE_PITCH", "")
+
+# --- SaluteSpeech (fallback) ---------------------------------------------
 SALUTE_AUTH_KEY = os.getenv("SALUTE_AUTH_KEY")
 SALUTE_SCOPE = os.getenv("SALUTE_SCOPE", "SALUTE_SPEECH_PERS")
 # Файл с несколькими ключами (для авто-переключения при исчерпании баланса).
 SALUTE_KEYS_FILE = os.getenv("SALUTE_KEYS_FILE", "salute_keys.json")
-TTS_VOICE = os.getenv("TTS_VOICE", "Nec_24000")
-TTS_LANG = os.getenv("TTS_LANG", "ru")
+SALUTE_VOICE = os.getenv("SALUTE_VOICE", os.getenv("TTS_VOICE", "Nec_24000"))
+SALUTE_LANG = os.getenv("SALUTE_LANG", "ru")
+
+# --- Общее ----------------------------------------------------------------
+TTS_LANG = os.getenv("TTS_LANG", "")  # пусто -> берётся из имени голоса Azure
+
+# Локальный учёт израсходованных символов (у Azure нет API остатка средств).
+# Пустой USAGE_FILE полностью отключает счётчик.
+USAGE_FILE = os.getenv("USAGE_FILE", "usage.json")
+try:
+    # Бесплатный тариф Azure F0 — 500 000 символов в месяц на ресурс.
+    MONTHLY_QUOTA_CHARS = int(os.getenv("MONTHLY_QUOTA_CHARS", "500000"))
+except ValueError:
+    MONTHLY_QUOTA_CHARS = 500_000
+
 ALLOWED_USERS_FILE = os.getenv("ALLOWED_USERS_FILE", "allowed_users.json")
 VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() not in ("0", "false", "no")
 SKIP_PREFIX = os.getenv("SKIP_PREFIX", "!")
@@ -105,10 +151,24 @@ TRACKED_CHANNEL_IDS = {
     s.strip() for s in os.getenv("TRACKED_CHANNEL_IDS", "").split(",") if s.strip()
 }
 
-MAX_TTS_CHARS = 4000  # ограничение SaluteSpeech на длину текста
+try:
+    # Ограничение на длину одного озвучиваемого сообщения. Лимит SaluteSpeech —
+    # 4000 символов; у Azure ограничение мягче (по длительности аудио), но
+    # длинные сообщения всё равно неудобны в голосовом чате.
+    MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "4000"))
+except ValueError:
+    MAX_TTS_CHARS = 4000
 
 # Вырезаем ссылки http(s):// ... до первого пробела.
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _num(n) -> str:
+    """12345 -> '12 345' (неразрывные пробелы не нужны — это чат, не вёрстка)."""
+    try:
+        return f"{int(n):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(n)
 
 
 def clean_text(text: str) -> str:
@@ -118,7 +178,16 @@ def clean_text(text: str) -> str:
 
 
 def load_allowed_users(path: str):
-    """Возвращает (set ID-строк, set ников в нижнем регистре)."""
+    """Возвращает (set ID-строк, set ников в нижнем регистре).
+
+    Сам файл в репозиторий не попадает (в нём личные Discord ID) — в свежей
+    копии проекта его нужно создать из allowed_users.example.json.
+    """
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"Нет файла со списком игроков ({path}). Создайте его из шаблона: "
+            "cp allowed_users.example.json allowed_users.json"
+        )
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     ids = {str(i).strip() for i in data.get("ids", []) if str(i).strip()}
@@ -151,6 +220,86 @@ def load_salute_keys() -> list[tuple[str, str]]:
         keys.append((SALUTE_AUTH_KEY, SALUTE_SCOPE))
         log.info("Использую одиночный SALUTE_AUTH_KEY из .env")
     return keys
+
+
+def load_azure_keys() -> list[dict]:
+    """Возвращает список ключей Azure Speech: [{key, region, endpoint, voice}, ...].
+
+    Источник — файл AZURE_KEYS_FILE, если он есть, иначе одиночный
+    AZURE_SPEECH_KEY из .env. Формат файла:
+        {"keys": [
+            {"key": "...", "region": "westeurope"},
+            {"key": "...", "region": "germanywestcentral", "voice": "ru-RU-DmitryNeural"}
+        ]}
+    Незаполненные region/voice берутся из .env (AZURE_SPEECH_REGION / AZURE_VOICE).
+    """
+    keys: list[dict] = []
+    if AZURE_KEYS_FILE and os.path.exists(AZURE_KEYS_FILE):
+        with open(AZURE_KEYS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for item in data.get("keys", []):
+            if isinstance(item, str):
+                keys.append({"key": item, "region": AZURE_SPEECH_REGION,
+                             "endpoint": AZURE_SPEECH_ENDPOINT, "voice": ""})
+            elif isinstance(item, dict) and item.get("key"):
+                keys.append({
+                    "key": item["key"],
+                    "region": item.get("region", AZURE_SPEECH_REGION),
+                    "endpoint": item.get("endpoint", AZURE_SPEECH_ENDPOINT),
+                    "voice": item.get("voice", ""),
+                })
+        log.info("Загружено %d ключ(ей) Azure Speech из %s", len(keys), AZURE_KEYS_FILE)
+    elif AZURE_SPEECH_KEY:
+        keys.append({"key": AZURE_SPEECH_KEY, "region": AZURE_SPEECH_REGION,
+                     "endpoint": AZURE_SPEECH_ENDPOINT, "voice": ""})
+        log.info("Использую одиночный AZURE_SPEECH_KEY из .env")
+    return keys
+
+
+def build_tts(usage: UsageTracker | None):
+    """Создаёт пул ключей выбранного провайдера (см. TTS_PROVIDER)."""
+    if TTS_PROVIDER == "azure":
+        keys = load_azure_keys()
+        if not keys:
+            raise SystemExit(
+                "Не задан ни один ключ Azure Speech "
+                "(AZURE_SPEECH_KEY + AZURE_SPEECH_REGION в .env или azure_keys.json). "
+                "Чтобы вернуться на Сбер, поставьте TTS_PROVIDER=salute."
+            )
+        # Диагностика ключей (сам секрет не печатаем).
+        for i, k in enumerate(keys, 1):
+            log.info("Ключ Azure #%d: длина %d, регион=%s%s", i, len(k["key"].strip()),
+                     k.get("region") or k.get("endpoint") or "не задан",
+                     f", голос={k['voice']}" if k.get("voice") else "")
+        return AzureTTSPool(
+            keys=keys,
+            voice=AZURE_VOICE,
+            lang=TTS_LANG,
+            output_format=AZURE_OUTPUT_FORMAT,
+            style=AZURE_VOICE_STYLE,
+            rate=AZURE_VOICE_RATE,
+            pitch=AZURE_VOICE_PITCH,
+            usage=usage,
+        )
+
+    keys = load_salute_keys()
+    if not keys:
+        raise SystemExit("Не задан ни один ключ SaluteSpeech "
+                         "(SALUTE_AUTH_KEY в .env или salute_keys.json)")
+    # Диагностика ключей (сам секрет не печатаем).
+    for i, (k, scope) in enumerate(keys, 1):
+        clean = sanitize_auth_key(k)
+        warn = check_auth_key(clean)
+        log.info("Ключ SaluteSpeech #%d: длина %d, scope=%s%s",
+                 i, len(clean), scope, "" if not warn else f" — ВНИМАНИЕ: {warn}")
+    return SaluteTTSPool(
+        keys=keys,
+        voice=SALUTE_VOICE,
+        lang=SALUTE_LANG or "ru",
+        audio_format="pcm16",
+        verify_ssl=VERIFY_SSL,
+        usage=usage,
+    )
 
 
 class TTSBot(discord.Client):
@@ -213,6 +362,7 @@ class TTSBot(discord.Client):
     async def on_ready(self):
         log.info("Бот запущен как %s (id=%s). Режим по умолчанию: %s, таймаут: %g мин",
                  self.user, self.user.id, DEFAULT_MODE, IDLE_TIMEOUT_MIN)
+        log.info("Синтез речи: %s", self.tts.describe())
         log.info("TRACKED_CHANNEL_IDS = %s",
                  sorted(TRACKED_CHANNEL_IDS) or "(пусто — слушаю все голосовые)")
         # Выводим ВСЕ голосовые каналы, их ID, отслеживание и права.
@@ -356,33 +506,59 @@ class TTSBot(discord.Client):
             return True
 
         if cmd == "balance":
-            rows = await self.tts.get_balances()
-            lines = []
-            for row in rows:
-                mark = " (активный)" if row.get("active") else ""
-                if row.get("exhausted"):
-                    mark += " [исчерпан]"
-                head = f"Ключ #{row['index']}{mark}:"
-                if "error" in row:
-                    lines.append(f"{head} баланс недоступен ({row['error']})")
-                else:
-                    items = row.get("balance") or []
-                    if not items:
-                        lines.append(f"{head} пусто")
-                    else:
-                        parts = []
-                        for it in items:
-                            if isinstance(it, dict):
-                                k = it.get("key") or it.get("packageName") or "пакет"
-                                v = it.get("value", it.get("balance", "?"))
-                                parts.append(f"{k}={v}")
-                            else:
-                                parts.append(str(it))
-                        lines.append(f"{head} " + ", ".join(parts))
-            await self._reply(message, "**Баланс ключей SaluteSpeech:**\n" + "\n".join(lines))
+            try:
+                rows = await self.tts.get_balances()
+            except TTSError as e:
+                await self._reply(message, f"Не удалось получить данные по ключам: {e}")
+                return True
+            await self._reply(message, self._format_balances(rows))
             return True
 
         return False
+
+    @staticmethod
+    def _format_balances(rows: list[dict]) -> str:
+        """Собирает ответ !balance: расход символов и/или остаток пакетов."""
+        title = ("**Ключи Azure Speech (расход символов, счёт локальный):**"
+                 if TTS_PROVIDER == "azure" else "**Ключи SaluteSpeech:**")
+        lines = []
+        for row in rows:
+            mark = " (активный)" if row.get("active") else ""
+            if row.get("exhausted"):
+                mark += " [исчерпан]"
+            parts = []
+
+            # Локальный счётчик символов (единственный источник цифр у Azure).
+            if "used" in row:
+                used = row["used"]
+                quota = row.get("quota") or 0
+                if quota:
+                    pct = used * 100 / quota
+                    text = (f"израсходовано {_num(used)} из {_num(quota)} "
+                            f"({pct:.1f}%), осталось {_num(row.get('remaining', 0))}")
+                else:
+                    text = f"израсходовано {_num(used)}"
+                if row.get("month"):
+                    text += f" за {row['month']}"
+                parts.append(text)
+
+            # Остаток пакетов из API (есть только у SaluteSpeech).
+            items = row.get("balance") or []
+            for it in items:
+                if isinstance(it, dict):
+                    k = it.get("key") or it.get("packageName") or "пакет"
+                    v = it.get("value", it.get("balance", "?"))
+                    parts.append(f"{k}={v}")
+                else:
+                    parts.append(str(it))
+
+            if row.get("error") and not items:
+                parts.append(f"баланс из API недоступен ({row['error']})")
+            if row.get("region"):
+                parts.append(f"регион {row['region']}")
+
+            lines.append(f"Ключ #{row['index']}{mark}: " + ("; ".join(parts) or "нет данных"))
+        return title + "\n" + "\n".join(lines)
 
     async def _reply(self, message: discord.Message, text: str):
         try:
@@ -405,8 +581,8 @@ class TTSBot(discord.Client):
                 await self._speak(channel, author_name, text)
             except PermissionError as e:
                 log.error("Нет прав: %s. Выдайте боту права на канал в настройках.", e)
-            except SaluteTTSError as e:
-                log.error("Ошибка SaluteSpeech: %s", e)
+            except TTSError as e:
+                log.error("Ошибка синтеза речи (%s): %s", TTS_PROVIDER, e)
             except Exception:
                 log.exception("Не удалось озвучить сообщение")
             finally:
@@ -510,28 +686,14 @@ def main():
         log.warning("PyNaCl не установлен — подключение к голосу НЕ заработает. "
                     "Установите: pip install -r requirements.txt (или pip install PyNaCl)")
 
-    keys = load_salute_keys()
-    if not keys:
-        raise SystemExit("Не задан ни один ключ SaluteSpeech "
-                         "(SALUTE_AUTH_KEY в .env или salute_keys.json)")
-
-    # Диагностика ключей (сам секрет не печатаем).
-    for i, (k, scope) in enumerate(keys, 1):
-        clean = sanitize_auth_key(k)
-        warn = check_auth_key(clean)
-        log.info("Ключ #%d: длина %d, scope=%s%s",
-                 i, len(clean), scope, "" if not warn else f" — ВНИМАНИЕ: {warn}")
-
     allowed_ids, allowed_names = load_allowed_users(ALLOWED_USERS_FILE)
 
-    tts = SaluteTTSPool(
-        keys=keys,
-        voice=TTS_VOICE,
-        lang=TTS_LANG,
-        audio_format="pcm16",
-        verify_ssl=VERIFY_SSL,
-    )
-    log.info("Пул SaluteSpeech: %d ключ(ей)", tts.size)
+    usage = UsageTracker(USAGE_FILE, quota=MONTHLY_QUOTA_CHARS) if USAGE_FILE else None
+    if usage is None:
+        log.info("USAGE_FILE пуст — локальный счётчик символов отключён")
+
+    tts = build_tts(usage)
+    log.info("Провайдер TTS: %s", tts.describe())
 
     intents = discord.Intents.default()
     intents.message_content = True  # ОБЯЗАТЕЛЬНО включить в Developer Portal
